@@ -1,7 +1,9 @@
 import os
 import time
+import shutil
 import streamlit as st
 import torch
+import gdown
 from pyvi import ViTokenizer
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
@@ -177,45 +179,97 @@ st.markdown("""
 
 
 # ==========================================
-# 2. KHỞI TẠO MÔ HÌNH & TOKENIZER (CACHED)
+# 2. CẤU HÌNH GOOGLE DRIVE & MODEL LOADER
 # ==========================================
-def resolve_model_path():
-    candidates = [
-        "models/phobert_voz1m_weighted_ce",
-        "Models/phobert_voz1m_weighted_ce",
-        os.path.join(os.path.dirname(__file__), "models", "phobert_voz1m_weighted_ce"),
-        os.path.join(os.path.dirname(__file__), "Models", "phobert_voz1m_weighted_ce"),
-    ]
-    for c in candidates:
-        if os.path.isdir(c) and (os.path.exists(os.path.join(c, "model.safetensors")) or os.path.exists(os.path.join(c, "pytorch_model.bin"))):
-            return c
-    return candidates[0]
+GDRIVE_FOLDER_URL = "https://drive.google.com/drive/folders/1itsSycYC5zwSoIyCMXP7h_sQZq5cCA5s?usp=sharing"
+DEFAULT_MODEL_DIR = os.path.join(os.path.dirname(__file__), "models", "phobert_voz1m_weighted_ce")
 
-MODEL_PATH = resolve_model_path()
+def is_valid_model_dir(dir_path: str) -> bool:
+    """Kiểm tra thư mục đã có đủ file trọng số model và cấu hình hợp lệ chưa."""
+    if not os.path.isdir(dir_path):
+        return False
+    has_weights = (
+        os.path.exists(os.path.join(dir_path, "model.safetensors")) or 
+        os.path.exists(os.path.join(dir_path, "pytorch_model.bin"))
+    )
+    has_config = os.path.exists(os.path.join(dir_path, "config.json"))
+    return has_weights and has_config
+
+def ensure_model_from_gdrive(dest_dir: str, force_download: bool = False) -> str:
+    """Tự động kiểm tra và tải mô hình từ Google Drive Public nếu chưa có trên máy."""
+    # Kiểm tra các thư mục local đã có sẵn
+    candidate_dirs = [
+        dest_dir,
+        os.path.join(os.path.dirname(__file__), "Models", "phobert_voz1m_weighted_ce"),
+        "models/phobert_voz1m_weighted_ce",
+        "Models/phobert_voz1m_weighted_ce"
+    ]
+    
+    if not force_download:
+        for c in candidate_dirs:
+            if is_valid_model_dir(c):
+                return c
+
+    # Nếu chưa có hoặc yêu cầu force download, tiến hành tải từ Google Drive
+    os.makedirs(dest_dir, exist_ok=True)
+    with st.status("📥 Đang đồng bộ và tải mô hình từ Google Drive Public...", expanded=True) as status:
+        st.write(f"🔗 **URL Nguồn**: [{GDRIVE_FOLDER_URL}]({GDRIVE_FOLDER_URL})")
+        st.write("⏳ Đang tải các tệp trọng số (model.safetensors ~540MB, config, vocab, bpe)...")
+        
+        try:
+            gdown.download_folder(
+                url=GDRIVE_FOLDER_URL,
+                output=dest_dir,
+                quiet=True,
+                use_cookies=False
+            )
+            # Nếu gdown tạo thư mục con bên trong dest_dir
+            for item in os.listdir(dest_dir):
+                item_path = os.path.join(dest_dir, item)
+                if os.path.isdir(item_path) and is_valid_model_dir(item_path):
+                    # Di chuyển các file ra ngoài dest_dir
+                    for f in os.listdir(item_path):
+                        shutil.move(os.path.join(item_path, f), os.path.join(dest_dir, f))
+                    try:
+                        os.rmdir(item_path)
+                    except Exception:
+                        pass
+                    break
+                    
+            status.update(label="✅ Tải mô hình từ Google Drive thành công!", state="complete", expanded=False)
+        except Exception as err:
+            status.update(label="❌ Lỗi khi tải mô hình từ Google Drive", state="error", expanded=True)
+            st.error(f"Chi tiết lỗi: {err}")
+            raise err
+
+    return dest_dir
 
 @st.cache_resource(show_spinner=False)
-def load_phobert_model(path):
+def load_phobert_model(model_path: str):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # Tokenizer load
+    # Nạp Tokenizer
     try:
-        tokenizer = AutoTokenizer.from_pretrained(path, use_fast=False)
+        tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
     except Exception:
         tokenizer = AutoTokenizer.from_pretrained("vinai/phobert-base", use_fast=False)
         
-    # Model load
-    model = AutoModelForSequenceClassification.from_pretrained(path)
+    # Nạp Model
+    model = AutoModelForSequenceClassification.from_pretrained(model_path)
     model.to(device)
     model.eval()
     
     return tokenizer, model, device
 
-with st.spinner("⏳ Đang nạp mô hình PhoBERT (1M WCE) vào bộ nhớ..."):
+
+# Khởi tạo mô hình
+with st.spinner("⏳ Đang kiểm tra và nạp mô hình PhoBERT (Drive Public)..."):
     try:
-        tokenizer, model, device = load_phobert_model(MODEL_PATH)
+        resolved_model_path = ensure_model_from_gdrive(DEFAULT_MODEL_DIR)
+        tokenizer, model, device = load_phobert_model(resolved_model_path)
         device_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
     except Exception as e:
-        st.error(f"❌ Không tìm thấy hoặc xảy ra lỗi khi nạp mô hình tại `{MODEL_PATH}`: {e}")
+        st.error(f"❌ Không thể nạp mô hình từ Google Drive. Lỗi chi tiết: {e}")
         st.stop()
 
 
@@ -227,6 +281,20 @@ with st.sidebar:
     st.caption("Vietnamese Hate Speech Detection")
     st.divider()
 
+    st.markdown("#### ☁️ Nguồn Dữ Liệu Mô Hình")
+    st.markdown(f"""
+    - **Nguồn**: [Google Drive Public Folder]({GDRIVE_FOLDER_URL})
+    - **Thư mục lưu trữ**: `{os.path.basename(resolved_model_path)}`
+    - **Trạng thái**: `🟢 Đã kết nối & nạp thành công`
+    """)
+
+    if st.button("🔄 Tải lại từ Google Drive", use_container_width=True, help="Tải lại trọng số mới nhất từ Google Drive Public"):
+        with st.spinner("Đang tải lại dữ liệu mới từ Google Drive..."):
+            st.cache_resource.clear()
+            ensure_model_from_gdrive(DEFAULT_MODEL_DIR, force_download=True)
+            st.rerun()
+
+    st.divider()
     st.markdown("#### ⚙️ Thông số Môi trường")
     st.markdown(f"""
     - **Thiết bị**: `{device_name}`
@@ -235,19 +303,19 @@ with st.sidebar:
     - **Độ dài ngữ cảnh**: `max_length = 128`
     """)
 
-    st.markdown("#### 🧠 Thông tin Mô hình")
+    st.markdown("#### 🧠 Thông tin Huấn luyện")
     st.markdown("""
     - **Base Model**: `vinai/phobert-base`
     - **Tập dữ liệu**: **VOZ 1M Comments**
     - **Xử lý mất cân bằng**: *Class-Weighted Cross-Entropy (WCE)*
-    - **Công cụ tách từ**: *PyVi (`ViTokenizer`)*
+    - **Bộ tách từ**: *PyVi (`ViTokenizer`)*
     """)
 
     st.divider()
     st.markdown("#### 🎯 Định nghĩa Nhãn")
     st.markdown("""
-    - 🟢 **CLEAN (0)**: Bình luận chuẩn mực, thảo luận lịch sự, hợp lệ.
-    - 🚫 **HATE (1)**: Bình luận công kích, thù hận, xúc phạm nhân phẩm.
+    - 🟢 **CLEAN (0)**: Bình luận chuẩn mực, an toàn, thảo luận xây dựng.
+    - 🚫 **HATE (1)**: Bình luận xúc phạm danh dự, công kích, khiêu khích, thù hận.
     """)
 
     st.divider()
@@ -262,7 +330,7 @@ with st.sidebar:
 # Hero Banner
 st.markdown("""
 <div class="hero-card">
-    <div class="hero-badge">🔬 Deep Learning NLP • Nghiên Cứu & Phát Triển</div>
+    <div class="hero-badge">🔬 Deep Learning NLP • Google Drive Public Model</div>
     <h1 class="hero-title">HỆ THỐNG PHÁT HIỆN BÌNH LUẬN ĐỘC HẠI TIẾNG VIỆT</h1>
     <p class="hero-subtitle">Mô hình <strong>PhoBERT (1M Samples - Class-Weighted Cross-Entropy)</strong> kiểm duyệt và phân loại nội dung mạng xã hội theo thời gian thực.</p>
 </div>
@@ -311,7 +379,7 @@ user_comment = st.text_area(
     "Nhập bình luận tiếng Việt cần kiểm duyệt tại đây:",
     key="comment_input",
     height=110,
-    placeholder="Nhập chuỗi bình luận tiếng Việt cần kiểm duyệt tại đây..."
+    placeholder="Nhập chuỗi bình luận tiếng Việt cần kiểm duyệt tại đây (ví dụ: đánh giá sản phẩm, tranh luận diễn đàn, mạng xã hội)..."
 )
 
 # Nút hành động
@@ -359,7 +427,8 @@ if should_infer:
         # Bước 4: Inference & Softmax
         with torch.no_grad():
             outputs = model(**inputs_device)
-            probs = torch.softmax(outputs.logits, dim=-1)[0]
+            logits = outputs.logits
+            probs = torch.softmax(logits, dim=-1)[0]
             prob_clean = probs[0].item() * 100.0
             prob_hate = probs[1].item() * 100.0
             pred_label = torch.argmax(probs).item()
